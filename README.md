@@ -5,8 +5,7 @@ says nothing about dollars. A node that calls a paid model on every step
 can retry 5 times, fail differently each time, and still bill in full —
 the step counter has no idea what any individual step cost, and by the
 time it fires, every one of those calls has already gone out and already
-been billed. A process that dies mid-loop doesn't even leave anything
-behind to freeze before the next run starts it all again.
+been billed.
 
 This repo is a 2-minute, reproducible demo of the actual fix: a real
 LangGraph retry loop tries to call a paid model 6 times, and
@@ -71,8 +70,15 @@ math and response shape — no network calls, no `VALTA_API_KEY`, no
   plays out over exactly 4 attempts: 3 approved, the 4th denied, well
   before the loop's own 6-attempt ceiling.
 - On approval, the demo calls the model (or a stub, in `--dry-run`), then
-  calls `report()` with the real cost — Cap's ledger trues up from the
-  estimate to the actual spend.
+  calls `report()`.
+
+  **Demo ledger uses the same $1.00 estimate as the "actual" cost, on
+  purpose** — this keeps hop 4's deny deterministic and reproducible for
+  the expected output below. A real integration should compute
+  `actual_usd` from the provider's own usage response
+  (`completion.usage`) and a real per-token price for the model, then
+  pass that real number to `report()` so the ledger genuinely trues up.
+  This demo isn't doing that math, and isn't pretending to.
 
 ## Expected output
 

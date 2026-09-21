@@ -128,6 +128,13 @@ def build_graph(
         state["rows"].append(row)
 
         if cap_report is not None:
+            # Demo simplification, not a bug: this reports the same $1.00
+            # used as the estimate, so hop 4's math stays exactly
+            # deterministic for the README's expected output. A real
+            # integration should compute actual_usd from the provider's
+            # own usage response (e.g. completion.usage) and a real price
+            # table for the model -- Valta doesn't compute that for you
+            # (see cap.mdx), and this demo isn't inventing one either.
             cap_report(allow_id=gate["id"], actual_usd=ESTIMATED_USD_PER_HOP)
 
         state["hop"] = hop
