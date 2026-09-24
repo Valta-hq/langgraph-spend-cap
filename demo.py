@@ -96,7 +96,20 @@ def make_live_call(model: str) -> Callable[[str, int], dict[str, Any]]:
                     "id": body.get("id", "-"),
                     "estimated_usd": None,
                 }
-            raise
+            # Not a Valta deny: Valta approved the call and OpenAI itself refused it.
+            err = body.get("error") if isinstance(body, dict) else None
+            err = err if isinstance(err, dict) else {}
+            code = err.get("code") or err.get("type") or "error"
+            hint = (
+                "\nThe OpenAI key stored in Valta has no credit. Add credit at "
+                "https://platform.openai.com/settings/organization/billing and rerun."
+                if code == "insufficient_quota"
+                else ""
+            )
+            raise SystemExit(
+                f"\nValta approved the call, but OpenAI returned HTTP {e.status_code} ({code}): "
+                f"{err.get('message', '')}{hint}"
+            )
         h = raw.headers
         return {
             "approved": True,

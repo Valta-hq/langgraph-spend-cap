@@ -47,10 +47,48 @@ decision the proxy makes, with the same estimate math.
    OPENAI_BASE_URL=https://valta.co/v1
    OPENAI_API_KEY=vk_live_...
    ```
-5. Run it:
+   Use `https://valta.co/v1` exactly (no `www`).
+5. Check the proxy is up:
+   ```bash
+   curl https://valta.co/v1/health
+   # {"status":"ok","failClosed":true,...}
+   ```
+   `"degraded"` (HTTP 503) means Valta can't decide right now, so it denies
+   every call rather than forwarding any.
+6. Run it:
    ```bash
    python demo.py
    ```
+
+The live path works on Valta's Free plan. Hops 1–3 are real OpenAI calls,
+so the OpenAI key you stored needs credit — a few tenths of a cent covers a
+run. With an unfunded key, Valta approves hop 1 and OpenAI answers
+`insufficient_quota`; the demo stops and says so.
+
+### See a deny with no OpenAI credit at all
+
+A denied call never reaches OpenAI, so it doesn't need credit. After step 3,
+send one call that's over the $0.06 per-run cap by itself:
+
+```bash
+curl https://valta.co/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"max_tokens":8000}'
+```
+
+Windows `cmd.exe` (one line, escaped quotes):
+
+```
+curl https://valta.co/v1/chat/completions -H "Authorization: Bearer vk_live_..." -H "Content-Type: application/json" -d "{\"model\":\"gpt-4.1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8000}"
+```
+
+Response (HTTP 402):
+
+```json
+{"approved":false,"reason":"per_run_limit","id":"allow_…","message":"Valta per-run limit reached for this run. No request was sent to OpenAI.","error":{"message":"…","type":"valta_denied","code":"per_run_limit"}}
+```
+
+The agent page in Valta shows it under **Last deny**.
 
 ## What the demo does
 
@@ -99,6 +137,9 @@ After a live run, open your
 as three gpt-4.1 requests. Hop 4 does not appear at all** — Valta refused
 it before it was sent, so there's nothing on OpenAI's side to bill.
 
+On the Valta side, the agent page's **Last deny** shows hop 4's
+`per_run_limit` with the same `allow_…` id the demo printed.
+
 ## What a deny looks like on the wire
 
 The proxy answers a denied call with HTTP `402` (budget) or `403`
@@ -125,7 +166,11 @@ and `id` from `e.response.json()`. SDKs don't auto-retry 402/403.
   pre-check, then records the real cost afterwards — an unbounded reply
   can overshoot the cap on that one call, and the overage denies the next
   one. Set `max_tokens` for a strict per-call bound.
-- Freezing the agent in the dashboard denies the very next call.
+- Freezing the agent (dashboard, or `POST /api/v1/agents/<id>/freeze`)
+  denies the very next call with `403 frozen`.
+- Free plan: 1 active virtual key, 10 requests/min, and $50/month of tracked
+  spend across the account. Past that, the proxy answers `402 plan_limit`
+  with the upgrade link — it doesn't let calls through.
 
 ## This is not LangSmith
 
