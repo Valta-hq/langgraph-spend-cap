@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-LangGraph retries a "paid model" call up to 6 times (simulating a
-tool-fail retry loop). Valta Cap denies the call BEFORE the provider is
-ever reached, once a $3 per-run cap is hit -- printing the deny reason
-and the allow_id, not just a warning after the fact.
+A LangGraph retry loop calls a paid model up to 6 times, doubling
+max_tokens on every retry (a common "the answer got cut off, try again with
+more room" pattern). The agent never holds an OpenAI key: it talks to
+Valta's OpenAI-compatible proxy with a Valta virtual key. Valta checks the
+agent's Cap before forwarding each call -- and once the next call would
+break the $0.06 per-run cap, Valta refuses it and OpenAI is never called.
 
 Usage:
-    python demo.py                 # live: real Valta Cap API + real OpenAI call
-    python demo.py --dry-run       # no keys needed: recorded deny fixture
+    python demo.py              # live: real Valta proxy -> real OpenAI
+    python demo.py --dry-run    # no keys, no network: same math, offline
 """
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import uuid
@@ -20,11 +23,13 @@ from typing import Any, Callable, TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 
-from valta_cap import CapClient, CapError
-
 MAX_HOPS = 6
-PER_RUN_LIMIT_USD = 3.00
-ESTIMATED_USD_PER_HOP = 1.00  # high enough that hop 4 exceeds the $3 per-run cap
+BASE_MAX_TOKENS = 1000
+PER_RUN_LIMIT_USD = 0.06
+PROMPT = "Say hello in five words or fewer."
+
+# gpt-4.1 list price per 1M tokens, as used by the proxy's own pre-check.
+PRICE_IN, PRICE_OUT = 2.00, 8.00
 
 
 class GraphState(TypedDict):
@@ -34,128 +39,113 @@ class GraphState(TypedDict):
     stopped: bool
 
 
-def make_dry_run_allow() -> Callable[..., dict[str, Any]]:
-    """A recorded fixture, not a fake SDK -- mirrors the real Cap ledger
-    math (cumulative spend against a $3 per-run cap) so `--dry-run` proves
-    the same deny-before-hop-4 behavior with zero network calls and zero
-    keys. Every field name matches the real /api/v1/cap/allow response."""
+def max_tokens_for(hop: int) -> int:
+    return BASE_MAX_TOKENS * 2 ** (hop - 1)
+
+
+def dry_run_estimate(max_tokens: int) -> float:
+    """Same pre-call estimate the proxy makes: ~4 chars/token input +
+    framing overhead, plus max_tokens as the output bound."""
+    input_tokens = math.ceil(len(PROMPT) / 4) + 4 + 3
+    return (input_tokens * PRICE_IN + max_tokens * PRICE_OUT) / 1_000_000
+
+
+def make_dry_run_call() -> Callable[[str, int], dict[str, Any]]:
+    """Offline stand-in for the proxy -- mirrors its decision (per-run
+    ledger, estimate checked BEFORE forwarding) and its response fields."""
     spent: dict[str, float] = {}
 
-    def allow(agent: str, run_id: str, estimated_usd: float, **kwargs: Any) -> dict[str, Any]:
-        already_spent = spent.get(run_id, 0.0)
-        would_be = round(already_spent + estimated_usd, 2)
+    def call(run_id: str, max_tokens: int) -> dict[str, Any]:
+        est = dry_run_estimate(max_tokens)
+        already = spent.get(run_id, 0.0)
         allow_id = f"allow_dryrun_{uuid.uuid4().hex[:8]}"
+        if est > PER_RUN_LIMIT_USD or already + est > PER_RUN_LIMIT_USD:
+            return {"approved": False, "reason": "per_run_limit", "id": allow_id, "estimated_usd": est}
+        actual = 0.00012  # a five-word reply is ~20 tokens, nowhere near max_tokens
+        spent[run_id] = already + actual
+        return {"approved": True, "reason": "-", "id": allow_id, "estimated_usd": est, "actual_usd": actual}
 
-        if would_be > PER_RUN_LIMIT_USD:
-            return {
-                "approved": False,
-                "reason": "per_run_limit",
-                "id": allow_id,
-                "remaining": {"run": max(0.0, round(PER_RUN_LIMIT_USD - already_spent, 2)), "day": None, "month": None},
-            }
+    return call
 
-        spent[run_id] = would_be
+
+def make_live_call(model: str) -> Callable[[str, int], dict[str, Any]]:
+    """Real OpenAI client, pointed at Valta. OPENAI_BASE_URL and
+    OPENAI_API_KEY (a Valta virtual key) come from the environment -- the
+    agent has no OpenAI key to leak or to bypass Valta with."""
+    import openai
+
+    client = openai.OpenAI(max_retries=0)  # the graph is the retry loop; no SDK retries on top
+
+    def call(run_id: str, max_tokens: int) -> dict[str, Any]:
+        try:
+            raw = client.chat.completions.with_raw_response.create(
+                model=model,
+                messages=[{"role": "user", "content": PROMPT}],
+                max_tokens=max_tokens,
+                extra_headers={"X-Valta-Run-Id": run_id},
+            )
+        except openai.APIStatusError as e:
+            try:
+                body = e.response.json()
+            except Exception:
+                body = {}
+            if body.get("approved") is False:
+                return {
+                    "approved": False,
+                    "reason": body.get("reason", "denied"),
+                    "id": body.get("id", "-"),
+                    "estimated_usd": None,
+                }
+            raise
+        h = raw.headers
         return {
             "approved": True,
-            "id": allow_id,
-            "remaining": {"run": round(PER_RUN_LIMIT_USD - would_be, 2), "day": None, "month": None},
-            "remainingPlanUsd": None,
+            "reason": "-",
+            "id": h.get("x-valta-allow-id", "-"),
+            "estimated_usd": float(h.get("x-valta-estimated-usd", "nan")),
+            "actual_usd": float(h["x-valta-actual-usd"]) if "x-valta-actual-usd" in h else None,
         }
 
-    return allow
+    return call
 
 
-def make_dry_run_report() -> Callable[..., dict[str, Any]]:
-    def report(allow_id: str, actual_usd: float) -> dict[str, Any]:
-        return {"ok": True, "allowId": allow_id, "actualUsd": actual_usd}
-
-    return report
-
-
-def call_provider(dry_run: bool, model: str) -> str:
-    if dry_run:
-        return "(dry-run) stub provider response -- no real API call made"
-    from openai import OpenAI
-
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    completion = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": "Say hello in five words or fewer."}],
-    )
-    return completion.choices[0].message.content or ""
-
-
-def build_graph(
-    agent_id: str,
-    cap_allow: Callable[..., dict[str, Any]],
-    cap_report: Callable[..., dict[str, Any]] | None,
-    dry_run: bool,
-    model: str,
-) -> Any:
-    def attempt_call(state: GraphState) -> GraphState:
+def build_graph(call: Callable[[str, int], dict[str, Any]]) -> Any:
+    def attempt(state: GraphState) -> GraphState:
         hop = state["hop"] + 1
+        max_tokens = max_tokens_for(hop)
+        result = call(state["run_id"], max_tokens)
 
-        # The one hard rule this whole demo exists to prove: call Cap
-        # BEFORE the provider, on every single attempt, no exceptions.
-        gate = cap_allow(
-            agent=agent_id,
-            run_id=state["run_id"],
-            estimated_usd=ESTIMATED_USD_PER_HOP,
-            merchant="openai",
-            model=model,
-            purpose="langgraph-retry-demo",
+        est = result.get("estimated_usd")
+        actual = result.get("actual_usd")
+        state["rows"].append(
+            {
+                "hop": hop,
+                "max_tokens": max_tokens,
+                "estimated_usd": f"{est:.4f}" if isinstance(est, float) else "-",
+                "actual_usd": f"{actual:.5f}" if isinstance(actual, float) else "-",
+                "approved": result["approved"],
+                "reason": result["reason"],
+                "allow_id": result["id"],
+                "reached_openai": result["approved"],
+            }
         )
-
-        row: dict[str, Any] = {
-            "hop": hop,
-            "estimated_usd": ESTIMATED_USD_PER_HOP,
-            "approved": gate["approved"],
-            "reason": gate.get("reason") or "-",
-            "allow_id": gate["id"],
-            "provider_called": False,
-        }
-
-        if not gate["approved"]:
-            # Denied -- stop. Do not catch-and-retry a deny; that would
-            # defeat the entire point of a hard stop.
-            state["rows"].append(row)
-            state["hop"] = hop
-            state["stopped"] = True
-            return state
-
-        call_provider(dry_run, model)
-        row["provider_called"] = True
-        state["rows"].append(row)
-
-        if cap_report is not None:
-            # Demo simplification, not a bug: this reports the same $1.00
-            # used as the estimate, so hop 4's math stays exactly
-            # deterministic for the README's expected output. A real
-            # integration should compute actual_usd from the provider's
-            # own usage response (e.g. completion.usage) and a real price
-            # table for the model -- Valta doesn't compute that for you
-            # (see cap.mdx), and this demo isn't inventing one either.
-            cap_report(allow_id=gate["id"], actual_usd=ESTIMATED_USD_PER_HOP)
-
         state["hop"] = hop
+        # A deny is final: never catch-and-retry it, that's the whole point.
+        state["stopped"] = not result["approved"]
         return state
 
-    def should_continue(state: GraphState) -> str:
-        if state["stopped"]:
-            return END
-        if state["hop"] >= MAX_HOPS:
-            return END
-        return "attempt_call"
+    def next_step(state: GraphState) -> str:
+        return END if state["stopped"] or state["hop"] >= MAX_HOPS else "attempt"
 
     graph = StateGraph(GraphState)
-    graph.add_node("attempt_call", attempt_call)
-    graph.set_entry_point("attempt_call")
-    graph.add_conditional_edges("attempt_call", should_continue, {"attempt_call": "attempt_call", END: END})
+    graph.add_node("attempt", attempt)
+    graph.set_entry_point("attempt")
+    graph.add_conditional_edges("attempt", next_step, {"attempt": "attempt", END: END})
     return graph.compile()
 
 
 def print_table(rows: list[dict[str, Any]]) -> None:
-    headers = ["hop", "estimated_usd", "approved", "reason", "allow_id", "provider_called"]
+    headers = ["hop", "max_tokens", "estimated_usd", "actual_usd", "approved", "reason", "allow_id", "reached_openai"]
     widths = {h: max(len(h), *(len(str(r[h])) for r in rows)) for h in headers}
     line = " | ".join(h.ljust(widths[h]) for h in headers)
     print(line)
@@ -166,54 +156,39 @@ def print_table(rows: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dry-run", action="store_true", help="Use a recorded deny fixture -- no keys, no network calls.")
-    parser.add_argument("--model", default="gpt-4.1", help="Model name to pass through to Cap and (if live) OpenAI.")
+    parser.add_argument("--dry-run", action="store_true", help="No keys, no network calls.")
+    parser.add_argument("--model", default="gpt-4.1", help="The math in the README assumes gpt-4.1.")
     args = parser.parse_args()
 
     load_dotenv()
 
-    agent_id = os.environ.get("VALTA_AGENT_ID", "ag_dryrun_demo" if args.dry_run else "")
-    if not args.dry_run and not agent_id:
-        print("VALTA_AGENT_ID is required for a live run. Set it in .env, or use --dry-run.", file=sys.stderr)
-        return 1
-
     if args.dry_run:
-        cap_allow = make_dry_run_allow()
-        cap_report = make_dry_run_report()
+        call = make_dry_run_call()
     else:
-        api_key = os.environ.get("VALTA_API_KEY", "")
-        if not api_key:
-            print("VALTA_API_KEY is required for a live run. Set it in .env, or use --dry-run.", file=sys.stderr)
+        base_url = os.environ.get("OPENAI_BASE_URL", "")
+        key = os.environ.get("OPENAI_API_KEY", "")
+        if not base_url or not key:
+            print("Set OPENAI_BASE_URL (Valta proxy) and OPENAI_API_KEY (Valta virtual key), or use --dry-run.", file=sys.stderr)
             return 1
-        if not os.environ.get("OPENAI_API_KEY"):
-            print("OPENAI_API_KEY is required for a live run (Cap only gates the call -- it never talks to OpenAI for you).", file=sys.stderr)
+        if not key.startswith("vk_live_"):
+            print("OPENAI_API_KEY should be a Valta virtual key (vk_live_...), not a raw OpenAI key.", file=sys.stderr)
             return 1
-        client = CapClient(api_key=api_key)
-        cap_allow = client.allow
-        cap_report = client.report
+        call = make_live_call(args.model)
 
     run_id = f"run_{uuid.uuid4().hex[:12]}"
-    initial_state: GraphState = {"hop": 0, "run_id": run_id, "rows": [], "stopped": False}
+    mode = "DRY RUN" if args.dry_run else f"LIVE via {os.environ.get('OPENAI_BASE_URL')}"
+    print(f"{mode} -- run_id={run_id} per_run_limit=${PER_RUN_LIMIT_USD:.2f}\n")
 
-    graph = build_graph(agent_id, cap_allow, cap_report, args.dry_run, args.model)
+    final = build_graph(call).invoke({"hop": 0, "run_id": run_id, "rows": [], "stopped": False})
+    print_table(final["rows"])
 
-    print(f"{'DRY RUN' if args.dry_run else 'LIVE'} -- agent={agent_id} run_id={run_id} per_run_limit=${PER_RUN_LIMIT_USD:.2f}\n")
-
-    try:
-        final_state = graph.invoke(initial_state)
-    except CapError as e:
-        print(f"Valta Cap API error: {e}", file=sys.stderr)
-        return 1
-
-    print_table(final_state["rows"])
-
-    denied = [r for r in final_state["rows"] if not r["approved"]]
+    denied = [r for r in final["rows"] if not r["approved"]]
     if denied:
-        print(f"\nStopped at hop {denied[0]['hop']}: {denied[0]['reason']} (allow_id={denied[0]['allow_id']})")
-        print("No provider call was made for the denied hop or any hop after it.")
+        d = denied[0]
+        print(f"\nStopped at hop {d['hop']}: {d['reason']} (allow_id={d['allow_id']})")
+        print("Valta refused that call before forwarding it -- it never reached OpenAI.")
     else:
-        print(f"\nCompleted all {len(final_state['rows'])} hops without hitting the per-run cap.")
-
+        print(f"\nCompleted all {len(final['rows'])} hops without hitting the per-run cap.")
     return 0
 
 
