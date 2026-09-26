@@ -47,7 +47,9 @@ decision the proxy makes, with the same estimate math.
    OPENAI_BASE_URL=https://valta.co/v1
    OPENAI_API_KEY=vk_live_...
    ```
-   Use `https://valta.co/v1` exactly (no `www`).
+   Use `https://valta.co/v1` exactly (no `www`). If `OPENAI_BASE_URL` is
+   unset, the demo uses `https://valta.co/v1`; it refuses to start with a raw
+   OpenAI key (`sk-...`) or a base URL pointing at `api.openai.com`.
 5. Check the proxy is up:
    ```bash
    curl https://valta.co/v1/health
@@ -181,7 +183,7 @@ the agent has no key to skip it with.
 
 ## What this demo is not
 
-No web UI, no Docker, no CrewAI/AutoGen, no wallet deposits, no x402, no
+No web UI, no Docker, no CrewAI/AutoGen, no wallet deposits, no
 marketplace. One graph, one proxy, one paid model, denied on schedule.
 
 ## License

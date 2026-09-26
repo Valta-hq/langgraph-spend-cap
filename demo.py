@@ -26,6 +26,7 @@ from langgraph.graph import StateGraph, END
 MAX_HOPS = 6
 BASE_MAX_TOKENS = 1000
 PER_RUN_LIMIT_USD = 0.06
+VALTA_BASE_URL = "https://valta.co/v1"  # the agent only ever talks to Valta
 PROMPT = "Say hello in five words or fewer."
 
 # gpt-4.1 list price per 1M tokens, as used by the proxy's own pre-check.
@@ -68,13 +69,14 @@ def make_dry_run_call() -> Callable[[str, int], dict[str, Any]]:
     return call
 
 
-def make_live_call(model: str) -> Callable[[str, int], dict[str, Any]]:
-    """Real OpenAI client, pointed at Valta. OPENAI_BASE_URL and
-    OPENAI_API_KEY (a Valta virtual key) come from the environment -- the
-    agent has no OpenAI key to leak or to bypass Valta with."""
+def make_live_call(model: str, base_url: str) -> Callable[[str, int], dict[str, Any]]:
+    """Real OpenAI client, pointed at Valta (base_url https://valta.co/v1).
+    OPENAI_API_KEY is a Valta virtual key -- the agent has no OpenAI key to
+    leak or to bypass Valta with."""
     import openai
 
-    client = openai.OpenAI(max_retries=0)  # the graph is the retry loop; no SDK retries on top
+    # The graph is the retry loop; no SDK retries on top.
+    client = openai.OpenAI(base_url=base_url, max_retries=0)
 
     def call(run_id: str, max_tokens: int) -> dict[str, Any]:
         try:
@@ -178,18 +180,21 @@ def main() -> int:
     if args.dry_run:
         call = make_dry_run_call()
     else:
-        base_url = os.environ.get("OPENAI_BASE_URL", "")
+        base_url = os.environ.get("OPENAI_BASE_URL") or VALTA_BASE_URL
         key = os.environ.get("OPENAI_API_KEY", "")
-        if not base_url or not key:
-            print("Set OPENAI_BASE_URL (Valta proxy) and OPENAI_API_KEY (Valta virtual key), or use --dry-run.", file=sys.stderr)
+        if not key:
+            print("Set OPENAI_API_KEY to your Valta virtual key (vk_live_...), or use --dry-run.", file=sys.stderr)
             return 1
         if not key.startswith("vk_live_"):
             print("OPENAI_API_KEY should be a Valta virtual key (vk_live_...), not a raw OpenAI key.", file=sys.stderr)
             return 1
-        call = make_live_call(args.model)
+        if "api.openai.com" in base_url:
+            print(f"OPENAI_BASE_URL must point at Valta ({VALTA_BASE_URL}), not OpenAI.", file=sys.stderr)
+            return 1
+        call = make_live_call(args.model, base_url)
 
     run_id = f"run_{uuid.uuid4().hex[:12]}"
-    mode = "DRY RUN" if args.dry_run else f"LIVE via {os.environ.get('OPENAI_BASE_URL')}"
+    mode = "DRY RUN" if args.dry_run else f"LIVE via {base_url}"
     print(f"{mode} -- run_id={run_id} per_run_limit=${PER_RUN_LIMIT_USD:.2f}\n")
 
     final = build_graph(call).invoke({"hop": 0, "run_id": run_id, "rows": [], "stopped": False})
